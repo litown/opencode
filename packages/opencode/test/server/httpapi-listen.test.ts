@@ -156,6 +156,16 @@ function waitForMessage(ws: WebSocket, predicate: (message: string) => boolean) 
   })
 }
 
+async function openPtySocket(listener: Awaited<ReturnType<typeof startListener>>, dir: string) {
+  const info = await createCat(listener, dir)
+  const ticket = await connectTicket(listener, info.id, dir)
+  const ws = await openSocket(socketURL(listener, info.id, dir, ticket.ticket))
+  return {
+    ws,
+    closed: new Promise<void>((resolve) => ws.addEventListener("close", () => resolve(), { once: true })),
+  }
+}
+
 describe("HttpApi Server.listen", () => {
   testPty("serves HTTP routes and upgrades PTY websocket through Server.listen", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
@@ -205,6 +215,47 @@ describe("HttpApi Server.listen", () => {
       }
     } finally {
       if (!stopped) await stop(listener, "timed out cleaning up listener").catch(() => undefined)
+    }
+  })
+
+  testPty("stop(true) is safe when called concurrently and repeatedly", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const listener = await startListener()
+    let stopped = false
+    try {
+      const socket = await openPtySocket(listener, tmp.path)
+
+      await withTimeout(
+        Promise.all([listener.stop(true), listener.stop(true)]).then(() => undefined),
+        10_000,
+        "timed out waiting for concurrent listener.stop(true)",
+      )
+      await withTimeout(socket.closed, 5_000, "timed out waiting for websocket close after concurrent stop")
+      await withTimeout(listener.stop(true), 5_000, "timed out waiting for repeated listener.stop(true)")
+      stopped = true
+    } finally {
+      if (!stopped) await stop(listener, "timed out cleaning up concurrent stop listener").catch(() => undefined)
+    }
+  })
+
+  testPty("stop(true) can force a graceful stop already in progress", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const listener = await startListener()
+    let stopped = false
+    try {
+      const socket = await openPtySocket(listener, tmp.path)
+
+      const graceful = listener.stop()
+      const forced = listener.stop(true)
+      await withTimeout(
+        Promise.all([graceful, forced]).then(() => undefined),
+        10_000,
+        "timed out waiting for forced listener stop",
+      )
+      await withTimeout(socket.closed, 5_000, "timed out waiting for websocket close after forced stop")
+      stopped = true
+    } finally {
+      if (!stopped) await stop(listener, "timed out cleaning up forced stop listener").catch(() => undefined)
     }
   })
 
